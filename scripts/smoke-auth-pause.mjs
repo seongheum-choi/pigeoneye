@@ -36,9 +36,15 @@ const podTable = {
   truncated: false, resource_version: "1", include: "Metadata",
 };
 
-// The exact shape of an expired-SSO exec failure, which isAuthError matches.
+// Two modes. "auth": an expired-credential exec failure — the cluster MUST be
+// parked, because retrying re-runs the browser-opening helper. "net": a plain
+// network blip — the cluster must KEEP being swept, because a blip does not
+// re-run the exec and pausing on one would silently freeze a healthy cluster.
+const MODE = process.env.SMOKE_MODE === "net" ? "net" : "auth";
 const AUTH_ERR =
-  'auth exec command failed: The SSO session associated with this profile has expired';
+  MODE === "net"
+    ? "error trying to connect: tcp connect error: Connection refused (os error 61)"
+    : "auth exec command failed: The SSO session associated with this profile has expired";
 
 const sweeps = []; // one entry per aggregate_issues call: the contexts asked for
 
@@ -99,22 +105,34 @@ q("button").find((b) => /issues/i.test(b.textContent || ""))?.click();
 await wait(600);
 if (crash) fail("crash after opening Issues", crash);
 
-const extra = sweeps.slice(afterFirst);
-const reSwept = extra.filter((t) => t.includes("smoke"));
-if (reSwept.length)
-  fail(
-    `BROWSER-STORM REGRESSION: the auth-failed cluster was swept again ${reSwept.length}x ` +
-    `after reporting expired credentials — each of those re-runs the exec (aws-vault opens a browser). ` +
-    `sweeps=${JSON.stringify(sweeps)}`,
+const reSwept = sweeps.slice(afterFirst).filter((t) => t.includes("smoke"));
+
+if (MODE === "auth") {
+  if (reSwept.length)
+    fail(
+      `BROWSER-STORM REGRESSION: the auth-failed cluster was swept again ${reSwept.length}x ` +
+      `after reporting expired credentials — each re-runs the exec (aws-vault opens a browser). ` +
+      `sweeps=${JSON.stringify(sweeps)}`,
+    );
+  // and the user still sees why it stopped, rather than it silently vanishing
+  const shown = root().textContent || "";
+  if (!/sign-in needed|paused|unreachable/i.test(shown))
+    fail("the paused cluster is invisible — no hint that it needs a sign-in", shown.slice(0, 300));
+  console.log(
+    `auth-pause smoke ok [auth] — cluster swept ${afterFirst}x, reported expired credentials, ` +
+    `then was never swept again (${sweeps.length} total) and stays visible as needing sign-in`,
   );
-
-// and the user still sees why it stopped, rather than it silently vanishing
-const shown = root().textContent || "";
-if (!/sign-in needed|paused|unreachable/i.test(shown))
-  fail("the paused cluster is invisible — the user gets no hint that it needs a sign-in", shown.slice(0, 300));
-
-console.log(
-  `auth-pause smoke ok — cluster swept ${afterFirst}x, reported expired credentials, ` +
-  `then was never swept again (${sweeps.length} total calls) and stays visible as needing sign-in`,
-);
+} else {
+  // A network blip must NOT park the cluster: it has to stay in the rotation.
+  if (!reSwept.length)
+    fail(
+      "OVER-PAUSE REGRESSION: a plain network error parked the cluster — a blip now " +
+      "silently freezes a healthy cluster's background updates until a manual reconnect. " +
+      `sweeps=${JSON.stringify(sweeps)}`,
+    );
+  console.log(
+    `auth-pause smoke ok [net] — a network error did NOT park the cluster; it was swept ` +
+    `again (${sweeps.length} total calls)`,
+  );
+}
 process.exit(0);

@@ -1837,10 +1837,11 @@ function App() {
 
   /// On an auth failure, ask the backend how this context logs in and
   /// offer to do it — an expired SSO session is a browser click away.
-  async function offerLogin(name: string) {
-    // Every auth failure funnels through here, so this is where background
-    // polling for the context gets parked until the user signs in again.
-    pauseAuth(name);
+  async function offerLogin(name: string, cause = "") {
+    // Park background polling only when the CREDENTIAL is what failed — that
+    // is the case whose retry re-runs the exec helper and can open a browser.
+    // A network blip still shows the banner but keeps the cluster live.
+    if (isCredError(cause)) pauseAuth(name);
     try {
       const hint = await invoke<{
         kind: string;
@@ -2063,6 +2064,17 @@ function App() {
       msg,
     );
 
+  /// The SUBSET of auth errors that mean the credential itself is broken, so
+  /// the next attempt will re-run the exec helper — which is the thing that
+  /// can open a browser. Network failures (refused / timed out / no such
+  /// host / certificate) are deliberately NOT here: they don't re-run the
+  /// exec, and pausing a cluster's background updates over a blip would be a
+  /// worse bug than the one the pause exists to prevent.
+  const isCredError = (msg: string) =>
+    /401|403|Unauthorized|Forbidden|credential|token|expired|exec plugin|auth exec|exec output/i.test(
+      msg,
+    );
+
   /// Drop the cached client and reconnect — the fix for an expired SSO
   /// token, since kubeconfig exec credentials are re-run on connect.
   /// Returns whether the reconnect succeeded.
@@ -2094,7 +2106,7 @@ function App() {
       if (abandoned.delete(name)) return false;
       if (focus) {
         setError(`could not connect to ${name}: ${msg}`);
-        if (isAuthError(msg)) void offerLogin(name);
+        if (isAuthError(msg)) void offerLogin(name, msg);
       }
       return false;
     } finally {
@@ -2838,7 +2850,7 @@ function App() {
         if (b.error) {
           errAcc[b.context] = b.error;
           // Stop at the FIRST failure: one browser, not one per minute.
-          if (isAuthError(b.error)) pauseAuth(b.context);
+          if (isCredError(b.error)) pauseAuth(b.context);
         } else acc.push(...b.issues);
         if (seen.size >= targets.length) publishQuiet();
         return;
@@ -2846,7 +2858,7 @@ function App() {
       setIssuePending(issuePending().filter((c) => c !== b.context));
       if (b.error) {
         setIssueErrors({ ...issueErrors(), [b.context]: b.error });
-        if (isAuthError(b.error)) pauseAuth(b.context);
+        if (isCredError(b.error)) pauseAuth(b.context);
       } else if (b.issues.length)
         setIssues(sortIss([...issues(), ...b.issues]));
       if (!issuePending().length) setIssuesLoading(false);
@@ -4021,7 +4033,7 @@ function App() {
       // did not do the job — let the next attempt run it again rather than
       // silently skipping the one step that might fix things.
       preRan.delete(name);
-      if (isAuthError(msg)) void offerLogin(name);
+      if (isAuthError(msg)) void offerLogin(name, msg);
     } finally {
       endConnect(name);
     }
@@ -4377,7 +4389,7 @@ function App() {
             ...failed().filter((f) => f.name !== name),
             { name, error: msg },
           ]);
-          if (isAuthError(msg)) void offerLogin(name);
+          if (isAuthError(msg)) void offerLogin(name, msg);
         })
         .finally(() => {
           endConnect(name);
@@ -4630,7 +4642,7 @@ function App() {
         // An expired token invalidates the whole tab, not just this list.
         if (isAuthError(msg)) {
           setFailed([{ name: ctx, error: msg }]);
-          void offerLogin(ctx);
+          void offerLogin(ctx, msg);
         }
         s0.setTable(null);
       }
@@ -4906,9 +4918,16 @@ function App() {
   /// opened a different node. `silent` refreshes in place (no spinner, no
   /// blanking) — used by the drain poll so the list updates without a
   /// flash every couple of seconds.
-  async function loadNodePods(nodeName: string, key: string, silent = false) {
+  /// Returns whether the list actually came back — the drain poll needs to
+  /// know, because a failing load must not be retried every 2.5s.
+  async function loadNodePods(
+    nodeName: string,
+    key: string,
+    silent = false,
+  ): Promise<boolean> {
     const pod = types().find((x) => x.group === "" && x.kind === "Pod");
-    if (!pod) return;
+    if (!pod) return false;
+    const ctx = active();
     if (!silent) {
       setNodePods(null);
       setNodePodsErr("");
@@ -4916,14 +4935,21 @@ function App() {
     }
     try {
       const t = await invoke<ResourceTable>("list_snapshot", {
-        context: active(),
+        context: ctx,
         resource: pod,
         namespace: null,
         fieldSelector: `spec.nodeName=${nodeName}`,
       });
       if (detailKey() === key) setNodePods(t);
+      return true;
     } catch (e) {
-      if (!silent && detailKey() === key) setNodePodsErr(String(e));
+      const msg = String(e);
+      // A silent load still has to report a credential failure: this call
+      // re-runs the kubeconfig exec, which can open a browser, so the
+      // circuit breaker must see it even when the UI stays quiet.
+      if (ctx && isCredError(msg)) pauseAuth(ctx);
+      if (!silent && detailKey() === key) setNodePodsErr(msg);
+      return false;
     } finally {
       if (!silent && detailKey() === key) setNodePodsLoading(false);
     }
@@ -4965,14 +4991,31 @@ function App() {
     const started = Date.now();
     let prev = -1;
     let stall = 0;
+    let misses = 0;
     const tick = async () => {
       // Only meaningful while looking at this node; give up after 5 min.
       if (detailKey() !== key || Date.now() - started > 5 * 60 * 1000) {
         stopDrainPoll();
         return;
       }
-      await loadNodePods(node, key, true);
+      // Broken credentials: every poll re-runs the exec, and that helper can
+      // open a browser. A 2.5s loop must never be the thing that does it.
+      const pollCtx = active();
+      if (pollCtx && authPaused().has(pollCtx)) {
+        stopDrainPoll();
+        return;
+      }
+      const got = await loadNodePods(node, key, true);
       if (detailKey() !== key) return;
+      if (!got) {
+        // A list that keeps failing will never report drain progress, and
+        // each attempt costs a credential call — stop instead of spinning
+        // out the full 5 minutes. (An auth failure has already paused the
+        // context above, so this is the non-auth backstop.)
+        if (++misses >= 3) stopDrainPoll();
+        return;
+      }
+      misses = 0;
       // Only judge off a real pod list — a null list (load failed) must not
       // read as "0 evictable".
       const rem = drainRemaining();
@@ -6292,7 +6335,9 @@ function App() {
   /// arrive. `refresh` skips the name index, which is what makes a second
   /// look at a churning kind honest.
   function runXSearch(rt: ResourceType, query: string, refresh = false) {
-    const targets = tabs();
+    // Skip clusters parked for broken credentials: they can only answer with
+    // an error, and asking costs a credential call that may open a browser.
+    const targets = tabs().filter((t) => !authPaused().has(t));
     if (!targets.length) return;
     setXSearch({ rt, query });
     setXHits([]);

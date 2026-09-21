@@ -4163,17 +4163,52 @@ pub async fn pf_start(
     let conns: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let conns2 = conns.clone();
+    // Consecutive upstream failures. Every new connection re-runs the
+    // kubeconfig exec, and that helper can open a BROWSER (`aws-vault exec`,
+    // oidc-login) — so a forward whose credentials died must not pay a
+    // credential call, and a browser tab, for each incoming connection. A
+    // client that retries (an auto-refreshing page, a health check) would
+    // otherwise drive that without limit. Three strikes and the listener
+    // closes; the forward is dead anyway.
+    let fails = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fails2 = fails.clone();
     let task = tokio::spawn(async move {
         loop {
+            if fails2.load(std::sync::atomic::Ordering::Relaxed) >= 3 {
+                break;
+            }
             let Ok((mut sock, _)) = listener.accept().await else {
                 break;
             };
             let pods = pods2.clone();
             let pod = podname.clone();
+            let f = fails2.clone();
             let h = tokio::spawn(async move {
-                if let Ok(mut pf) = pods.portforward(&pod, &[port]).await {
-                    if let Some(mut upstream) = pf.take_stream(port) {
-                        let _ = tokio::io::copy_bidirectional(&mut sock, &mut upstream).await;
+                match pods.portforward(&pod, &[port]).await {
+                    Ok(mut pf) => {
+                        f.store(0, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(mut upstream) = pf.take_stream(port) {
+                            let _ =
+                                tokio::io::copy_bidirectional(&mut sock, &mut upstream).await;
+                        }
+                    }
+                    Err(e) => {
+                        // Only a CREDENTIAL failure counts toward the strike
+                        // limit — that is the one whose retry re-runs the exec
+                        // helper and can open a browser. A transient upstream
+                        // failure (a pod restarting mid-forward) must not tear
+                        // down an otherwise healthy forward.
+                        let m = e.to_string().to_lowercase();
+                        if m.contains("401")
+                            || m.contains("403")
+                            || m.contains("unauthorized")
+                            || m.contains("forbidden")
+                            || m.contains("credential")
+                            || m.contains("exec plugin")
+                            || m.contains("auth exec")
+                        {
+                            f.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
             });
